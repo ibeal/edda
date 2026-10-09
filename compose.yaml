@@ -1,0 +1,100 @@
+# edda — Postgres for agent logs, tasks and docs. Agents connect directly as the shared `agent` role.
+# Secrets come from .env (gitignored; see .env.example). `docker compose up -d` starts the database,
+# (re)applies roles, then applies migrations. Only the one-shot services hold admin credentials.
+
+name: edda
+
+services:
+  db:
+    image: postgres:18
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: ${ADMIN_PASSWORD:?set ADMIN_PASSWORD in .env}
+      POSTGRES_DB: edda
+    ports:
+      - "127.0.0.1:${EDDA_PORT:-5432}:5432"   # host-only; sandboxes reach it via the host
+    volumes:
+      - pgdata:/var/lib/postgresql              # postgres:18+ keeps PGDATA under this path
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U admin -d edda"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+  bootstrap:
+    image: postgres:18
+    depends_on:
+      db: { condition: service_healthy }
+    restart: "no"
+    environment:
+      PGHOST: db
+      PGUSER: admin
+      PGPASSWORD: ${ADMIN_PASSWORD}
+      PGDATABASE: edda
+      AGENT_PASSWORD: ${AGENT_PASSWORD:?set AGENT_PASSWORD in .env}
+    volumes:
+      - ./bootstrap:/bootstrap:ro
+    entrypoint: ["sh", "-c", "psql -X -v ON_ERROR_STOP=1 -v agent_password=\"$$AGENT_PASSWORD\" -f /bootstrap/roles.sql"]
+
+  migrate:
+    image: ghcr.io/amacneil/dbmate:2
+    depends_on:
+      bootstrap: { condition: service_completed_successfully }
+    restart: "no"
+    environment:
+      DATABASE_URL: postgres://admin:${ADMIN_PASSWORD}@db:5432/edda?sslmode=disable
+      DBMATE_MIGRATIONS_DIR: /db/migrations
+      DBMATE_SCHEMA_FILE: /db/schema.sql
+    volumes:
+      - ./db:/db
+    command: ["--wait", "up"]
+
+  # Host-side backups: pg_dump into $BACKUP_DIR on the host (default ./backups). No cloud, no restic.
+  # Holds admin credentials, like the other one-shot services.
+  backup:
+    image: postgres:18
+    depends_on:
+      db: { condition: service_healthy }
+      migrate: { condition: service_completed_successfully }
+    restart: unless-stopped
+    environment:
+      PGHOST: db
+      PGUSER: admin
+      PGPASSWORD: ${ADMIN_PASSWORD}
+      PGDATABASE: edda
+      BACKUP_INTERVAL_HOURS: ${BACKUP_INTERVAL_HOURS:-24}
+      BACKUP_KEEP: ${BACKUP_KEEP:-14}
+    volumes:
+      - ./backup:/scripts:ro
+      - ${BACKUP_DIR:-./backups}:/backups
+    entrypoint: ["sh", "/scripts/backup.sh"]
+    command: ["loop"]
+    healthcheck:   # unhealthy when the newest dump is older than twice the interval
+      test: ["CMD", "sh", "/scripts/backup.sh", "health"]
+      interval: 15m
+      timeout: 10s
+      retries: 1
+      start_period: 5m
+      start_interval: 5s   # probe quickly until the first dump exists, so `up --wait` returns
+
+  # On demand only (profile): docker compose run --rm -e EDDA_RESTORE_CONFIRM=yes restore [dump]
+  restore:
+    image: postgres:18
+    profiles: ["restore"]
+    depends_on:
+      bootstrap: { condition: service_completed_successfully }
+    restart: "no"
+    environment:
+      PGHOST: db
+      PGUSER: admin
+      PGPASSWORD: ${ADMIN_PASSWORD}
+      PGDATABASE: edda
+      EDDA_RESTORE_CONFIRM: ${EDDA_RESTORE_CONFIRM:-}
+    volumes:
+      - ./backup:/scripts:ro
+      - ${BACKUP_DIR:-./backups}:/backups
+    entrypoint: ["sh", "/scripts/restore.sh"]
+
+volumes:
+  pgdata:
