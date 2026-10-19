@@ -1,7 +1,9 @@
 # edda — for agents
 
 A Postgres database holding three things. You connect directly with `psql` as the shared `agent` role
-(standard libpq env: `PGHOST`, `PGPORT`, `PGDATABASE=edda`, `PGUSER=agent`, `PGPASSWORD`).
+(standard libpq env: `PGHOST`, `PGPORT`, `PGDATABASE=edda`, `PGUSER=agent`, `PGPASSWORD`). From a sandbox on
+the `edda_agents` Docker network use `PGHOST=edda-db`; from the host use `PGHOST=localhost` and the published
+port. `agent` is the only role that can log in over the network, and only to `edda`.
 If it is unreachable, that is a hard failure — say so, don't work around it.
 
 | Table | What | You can |

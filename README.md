@@ -12,7 +12,8 @@ docker compose up -d     # db → bootstrap (roles) → migrate (dbmate); idempo
 
 ## Layout
 ```
-compose.yaml          postgres:18 + one-shot bootstrap + one-shot migrate (only these hold admin creds)
+compose.yaml          postgres:18 on the `agents` network; bootstrap/migrate/backup/restore sidecars, no network
+config/pg_hba.conf    admin: socket only. agent: TCP, edda database only. Everything else rejected
 bootstrap/roles.sql   cluster-level role + password (not schema); re-run on every `up`
 db/migrations/        plain SQL, forward-only, dbmate format. Grants are schema, so they live here
 db/schema.sql         dbmate's dump after each run — commit it; PR diffs show what changed
@@ -51,8 +52,19 @@ Both sidecars hold admin credentials.
 3. Add checks to `test/verify.sh` for any new guarantee, then `test/scratch.sh`.
 4. `docker compose up -d` applies it. Agents never run DDL; they propose via PR or a `schema:proposal` log.
 
-Elevated cleanup (deleting rows, curating docs) uses the admin login, e.g.
-`psql postgresql://admin@localhost:5432/edda`.
+Elevated cleanup (deleting rows, curating docs) uses an admin shell, which has no network path (see Access):
+`docker compose exec db psql -U admin -d edda`.
+
+## Access
+- **Agents** log in over TCP as role `agent` only, to the `edda` database only, with a password:
+  - from a sandbox: join the Docker network `edda_agents` (`docker run --network edda_agents ...`) and use `PGHOST=edda-db`;
+  - from the host: the published port, `PGHOST=localhost PGPORT=$EDDA_PORT`.
+- **Admin** exists only on the unix socket (`config/pg_hba.conf` rejects it over TCP from anywhere). The one-shot
+  sidecars (bootstrap, migrate, backup, restore) share that socket by volume and run with `network_mode: none`;
+  you get in with `docker compose exec db psql -U admin -d edda`. Whoever can mount the `pgsocket` volume is
+  admin, which is the same trust as having docker access.
+- The published port binds `127.0.0.1` by default; `EDDA_BIND=0.0.0.0` serves other machines (still only `agent`).
+- Sandboxes on the same network can reach each other as well as the database; the database holds nothing else.
 
 ## Shape notes
 - `meta jsonb` on every table is unconstrained on purpose. Promote a key to a column once it earns it.

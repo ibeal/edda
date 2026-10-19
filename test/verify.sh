@@ -2,17 +2,19 @@
 # Guardrail regression: asserts what the shared `agent` role can and cannot do. Run on every migration.
 #
 #   agent connection: standard libpq env (PGHOST, PGPORT, PGPASSWORD, PGDATABASE), user = agent
-#   ADMIN_URL:        admin connection string (needed: docs are admin-written, and cleanup)
+#   ADMIN_URL | ADMIN_PSQL:  how to act as admin (docs are admin-written; cleanup). ADMIN_PSQL is an
+#                     executable that runs `psql -At -U admin` (admin has no TCP path in the container stack)
 #
 # Everything it writes is prefixed `verify-` (tasks, docs) or tagged `verify` (logs), and is removed
 # at the end by the admin. Exit 0 = all checks passed.
 set -u
-: "${ADMIN_URL:?set ADMIN_URL to an admin connection string}"
+: "${ADMIN_PSQL:-${ADMIN_URL:?set ADMIN_URL (admin connection string) or ADMIN_PSQL (admin psql wrapper)}}"
 fail=0
 AGENT="${AGENT_USER:-agent}"
 
 q()  { psql -X -q -v ON_ERROR_STOP=1 -At -U "$AGENT" -c "$1" 2>&1; }
-qa() { psql -X -q -v ON_ERROR_STOP=1 -At "$ADMIN_URL" -c "$1" 2>&1; }
+# admin: an executable that runs psql as admin (ADMIN_PSQL, e.g. a `docker compose exec` wrapper), or a URL
+qa() { if [ -n "${ADMIN_PSQL:-}" ]; then "$ADMIN_PSQL" -v ON_ERROR_STOP=1 -c "$1" 2>&1; else psql -X -q -v ON_ERROR_STOP=1 -At "$ADMIN_URL" -c "$1" 2>&1; fi; }
 
 ok()    { out=$(q "$2");  rc=$?; if [ $rc -eq 0 ]; then echo "ok   $1"; else echo "FAIL $1: $out"; fail=1; fi; }
 deny()  { out=$(q "$2");  rc=$?; if [ $rc -ne 0 ] && printf %s "$out" | grep -q -i -E "$3"; then echo "ok   $1"; else echo "FAIL $1 (wanted /$3/): rc=$rc $out"; fail=1; fi; }

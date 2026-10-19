@@ -1,21 +1,43 @@
 # edda — Postgres for agent logs, tasks and docs. Agents connect directly as the shared `agent` role.
+#
+# Access model
+#   agents    TCP, role `agent` only: from sandboxes on the `agents` network (host name `edda-db`), or from
+#             the host through the published port. pg_hba.conf rejects every other user over TCP.
+#   admin     unix socket only, shared by volume with the one-shot sidecars below (which therefore need
+#             no network at all). To get an admin shell yourself:
+#               docker compose exec db psql -U admin -d edda
+#             Whoever can mount the `pgsocket` volume is admin, which is the same trust as docker access.
+#
 # Secrets come from .env (gitignored; see .env.example). `docker compose up -d` starts the database,
-# (re)applies roles, then applies migrations. Only the one-shot services hold admin credentials.
+# (re)applies roles, then applies migrations.
 
 name: edda
+
+networks:
+  agents:
+    # Sandboxes join this (docker run --network edda_agents ...), and it holds only the database.
+    name: ${EDDA_AGENTS_NETWORK:-edda_agents}
 
 services:
   db:
     image: postgres:18
     restart: unless-stopped
+    command: ["postgres", "-c", "hba_file=/etc/edda/pg_hba.conf"]
     environment:
       POSTGRES_USER: admin
-      POSTGRES_PASSWORD: ${ADMIN_PASSWORD:?set ADMIN_PASSWORD in .env}
+      POSTGRES_PASSWORD: ${ADMIN_PASSWORD:?set ADMIN_PASSWORD in .env}   # init only; admin has no TCP path
       POSTGRES_DB: edda
+    networks:
+      agents:
+        aliases: [edda-db]
     ports:
-      - "127.0.0.1:${EDDA_PORT:-5432}:5432"   # host-only; sandboxes reach it via the host
+      # For agents running on the host. Set EDDA_BIND=0.0.0.0 to serve other machines (only role `agent`
+      # can log in over TCP, and only to the edda database).
+      - "${EDDA_BIND:-127.0.0.1}:${EDDA_PORT:-5432}:5432"
     volumes:
       - pgdata:/var/lib/postgresql              # postgres:18+ keeps PGDATA under this path
+      - pgsocket:/var/run/postgresql
+      - ./config/pg_hba.conf:/etc/edda/pg_hba.conf:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U admin -d edda"]
       interval: 3s
@@ -24,48 +46,51 @@ services:
 
   bootstrap:
     image: postgres:18
+    network_mode: none
     depends_on:
       db: { condition: service_healthy }
     restart: "no"
     environment:
-      PGHOST: db
+      PGHOST: /var/run/postgresql
       PGUSER: admin
-      PGPASSWORD: ${ADMIN_PASSWORD}
       PGDATABASE: edda
       AGENT_PASSWORD: ${AGENT_PASSWORD:?set AGENT_PASSWORD in .env}
     volumes:
+      - pgsocket:/var/run/postgresql
       - ./bootstrap:/bootstrap:ro
     entrypoint: ["sh", "-c", "psql -X -v ON_ERROR_STOP=1 -v agent_password=\"$$AGENT_PASSWORD\" -f /bootstrap/roles.sql"]
 
   migrate:
     image: ghcr.io/amacneil/dbmate:2
+    network_mode: none
     depends_on:
       bootstrap: { condition: service_completed_successfully }
     restart: "no"
     environment:
-      DATABASE_URL: postgres://admin:${ADMIN_PASSWORD}@db:5432/edda?sslmode=disable
+      DATABASE_URL: postgres://admin@/edda?host=/var/run/postgresql&sslmode=disable
       DBMATE_MIGRATIONS_DIR: /db/migrations
       DBMATE_SCHEMA_FILE: /db/schema.sql
     volumes:
+      - pgsocket:/var/run/postgresql
       - ./db:/db
     command: ["--wait", "up"]
 
   # Host-side backups: pg_dump into $BACKUP_DIR on the host (default ./backups). No cloud, no restic.
-  # Holds admin credentials, like the other one-shot services.
   backup:
     image: postgres:18
+    network_mode: none
     depends_on:
       db: { condition: service_healthy }
       migrate: { condition: service_completed_successfully }
     restart: unless-stopped
     environment:
-      PGHOST: db
+      PGHOST: /var/run/postgresql
       PGUSER: admin
-      PGPASSWORD: ${ADMIN_PASSWORD}
       PGDATABASE: edda
       BACKUP_INTERVAL_HOURS: ${BACKUP_INTERVAL_HOURS:-24}
       BACKUP_KEEP: ${BACKUP_KEEP:-14}
     volumes:
+      - pgsocket:/var/run/postgresql
       - ./backup:/scripts:ro
       - ${BACKUP_DIR:-./backups}:/backups
     entrypoint: ["sh", "/scripts/backup.sh"]
@@ -81,20 +106,22 @@ services:
   # On demand only (profile): docker compose run --rm -e EDDA_RESTORE_CONFIRM=yes restore [dump]
   restore:
     image: postgres:18
+    network_mode: none
     profiles: ["restore"]
     depends_on:
       bootstrap: { condition: service_completed_successfully }
     restart: "no"
     environment:
-      PGHOST: db
+      PGHOST: /var/run/postgresql
       PGUSER: admin
-      PGPASSWORD: ${ADMIN_PASSWORD}
       PGDATABASE: edda
       EDDA_RESTORE_CONFIRM: ${EDDA_RESTORE_CONFIRM:-}
     volumes:
+      - pgsocket:/var/run/postgresql
       - ./backup:/scripts:ro
       - ${BACKUP_DIR:-./backups}:/backups
     entrypoint: ["sh", "/scripts/restore.sh"]
 
 volumes:
   pgdata:
+  pgsocket:
