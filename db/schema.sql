@@ -40,6 +40,19 @@ $$;
 
 
 --
+-- Name: memory_get(text); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.memory_get(p_name text) RETURNS text
+    LANGUAGE sql STABLE
+    AS $$
+  SELECT body FROM logs
+  WHERE tags && ARRAY['kind:memory', 'kind:archive'] AND meta ->> 'name' = p_name
+  ORDER BY created_at DESC, id DESC LIMIT 1
+$$;
+
+
+--
 -- Name: tasks_guard(); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -158,6 +171,31 @@ ALTER TABLE public.logs ALTER COLUMN id ADD GENERATED ALWAYS AS IDENTITY (
     NO MAXVALUE
     CACHE 1
 );
+
+
+--
+-- Name: memory_index; Type: VIEW; Schema: public; Owner: -
+--
+
+CREATE VIEW public.memory_index AS
+ SELECT id,
+    author,
+    tags,
+    created_at,
+    ( SELECT substr(t.t, 6) AS substr
+           FROM unnest(logs.tags) t(t)
+          WHERE (t.t ~~ 'kind:%'::text)
+         LIMIT 1) AS kind,
+    ( SELECT substr(t.t, 7) AS substr
+           FROM unnest(logs.tags) t(t)
+          WHERE (t.t ~~ 'scope:%'::text)
+         LIMIT 1) AS scope,
+    (meta ->> 'name'::text) AS name,
+    COALESCE((meta ->> 'summary'::text), "left"(split_part(body, '
+'::text, 1), 160)) AS summary
+   FROM public.logs
+  WHERE (tags && ARRAY['kind:memory'::text, 'kind:archive'::text])
+  ORDER BY created_at DESC;
 
 
 --
@@ -415,4 +453,5 @@ ALTER TABLE public.docs ENABLE ROW LEVEL SECURITY;
 --
 
 INSERT INTO public.schema_migrations (version) VALUES
-    ('20261008000000');
+    ('20261008000000'),
+    ('20261009000000');
